@@ -1,6 +1,7 @@
 #include <xc.h>
 #include <stdint.h>
 #include <limits.h>
+#include <sys/attribs.h>
 
 #include "ADC.h"
 #include "FreeRTOSConfig.h"
@@ -10,6 +11,7 @@
 
 static void ADC_powerUp();
 static void ADC_powerDown();
+static DMA_RINGBUFFERHANDLE_t * ADC_currentBuffer = NULL;
 
 static struct ADC_setup{
     uint32_t ASAM;
@@ -53,6 +55,8 @@ uint32_t ADC_getActiveChannelCount(){
     if(AD1CON2bits.ALTS){
         channelsActive *= 2;
     }
+    
+    return channelsActive;
 }
 
 #define ADC_MAX_CLOCKRATE_NORMAL 5000000
@@ -66,57 +70,41 @@ uint32_t ADC_setupAutoSampling(uint32_t enabled, uint32_t sampleRate_Hz){
     //setup automatic sampling at a given sampling rate
     
     //calculate the required divider ratios
-
-    uint32_t totalDividerRatio = configPERIPHERAL_CLOCK_HZ / (sampleRate_Hz * 12);
-
+    uint32_t totalDividerRatio = configPERIPHERAL_CLOCK_HZ / (2*sampleRate_Hz);
+    
     //check if we can even go that slow (maximum divider we can do is 31 * 512)
-    if(totalDividerRatio > 15872){
+    if(totalDividerRatio > 256 * (12+0b11111)){
         //hmm the sample rate is so slow we can't divide the clock enough. Return with an error
         return pdFAIL;
     }else{
-        //find a divider that gets closest to achieving the desired sample rate without any rounding errors
-
-        //whats the smallest postscaler ratio that still allows us to reach the desired samplerate?
-        uint32_t minimumPostscaler = totalDividerRatio / 512;
-        if(minimumPostscaler == 0) minimumPostscaler = 1;
-
-        //whats the smallest divider ratio we can use without exceeding adc spec?
-        uint32_t minimumClockDivider = (configPERIPHERAL_CLOCK_HZ / ADC_MAX_CLOCKRATE_NORMAL) + 1;
-
-        //would that still allow us to fulfill the desired sample rate?
-        if(totalDividerRatio < minimumClockDivider){
-            //no unfortunately not :(
-            return pdFAIL;
-        }
-
-        uint32_t maximumPostscaler = totalDividerRatio / minimumClockDivider;
-        if(maximumPostscaler > 31) maximumPostscaler = 31;
-
+        //calculate aquisition time (totalDividerRatio = ADCS * (12 + SAMC))
         uint32_t clockDivider = 0;
-        uint32_t bestPostscaler = 0;
+        uint32_t bestSAMC = 0;
 
         //step through and find the best match
         int32_t bestError = INT_MAX;
-        for(uint32_t currentPostscaler = minimumPostscaler; currentPostscaler <= maximumPostscaler; currentPostscaler++){
-        //calculate the adc clock divider resulting from the current postscaler
-            int32_t currClockDivider = totalDividerRatio / currentPostscaler;
+        for(uint32_t currentSAMC = 1; currentSAMC <= 0b11111; currentSAMC++){
+            //calculate the adc clock divider resulting from the current postscaler
+            int32_t currClockDivider = totalDividerRatio / (12+currentSAMC);
+            
+            if(currClockDivider == 0) continue;
 
             //calculate the resulting ACTUAL sample rate, including any potential rounding errors and the resulting total sample rate error
-            int32_t effectiveSampleRate_Hz = configPERIPHERAL_CLOCK_HZ / ((currClockDivider/2)*2) / currentPostscaler;
+            int32_t effectiveSampleRate_Hz = configPERIPHERAL_CLOCK_HZ / (2 * currClockDivider * (12 + currentSAMC));
             int32_t error = abs(effectiveSampleRate_Hz - sampleRate_Hz);
 
             //is the error for the current divider lower than the best one so far?
             if(error < bestError){
                 //yes => save the current ratios
-                bestPostscaler = currentPostscaler;
+                bestSAMC = currentSAMC;
                 clockDivider = currClockDivider;
                 bestError = error;
             }
         }
 
         //now apply the divider ratios
-        AD1CON3bits.SAMC = bestPostscaler;
-        AD1CON3bits.ADCS = (clockDivider/2) - 1;
+        AD1CON3bits.SAMC = bestSAMC;
+        AD1CON3bits.ADCS = clockDivider - 1;
     }
 }
 
@@ -125,14 +113,11 @@ void ADC_selectScanChannels(uint32_t channelsSelected){
     
     //check if the adc is currently auto-sampling
     if(ADC_isAutoSampling() && ADC_isScanning()){
-        //yes, we need to disable it so we don't misalign the buffer position and the channels
-        ADC_stopAutoSampling();
-        resumeSampling = 1;
+        //yes, since we can't change any settings (as the buffer size is not dynamic) we just return
+        return;
     }
     
     AD1CSSL = channelsSelected & 0xffff;
-    
-    if(resumeSampling) ADC_startAutoSampling();
 }
 
 void ADC_setMuxAConfig(uint32_t posInput, uint32_t negInput){
@@ -150,9 +135,8 @@ void ADC_setInputScan(uint32_t scanningEnabled, uint32_t alternatingEnabled){
     
     //check if we will change the scanning setting
     if(ADC_isAutoSampling() && (ADC_isScanning() != scanningEnabled)){
-        //yes, we need to disable asam so we don't misalign the buffer position and the channels
-        ADC_stopAutoSampling();
-        resumeSampling = 1;
+        //yes, since we can't change any settings (as the buffer size is not dynamic) we just return
+        return;
     }
     
     //check if we will change the mux alternating setting
@@ -164,8 +148,6 @@ void ADC_setInputScan(uint32_t scanningEnabled, uint32_t alternatingEnabled){
     
     AD1CON2bits.ALTS = alternatingEnabled;
     AD1CON2bits.CSCNA = scanningEnabled;
-    
-    if(resumeSampling) ADC_startAutoSampling();
 }
 
 void ADC_stopAutoSampling(){
@@ -179,13 +161,19 @@ void ADC_stopAutoSampling(){
 #else
         while(AD1CON1 & _AD1CON1_CLRASAM_MASK);
 #endif
+        //de-initialize the ringbuffer (this will flush all data!)
+        DMA_freeRingBuffer(ADC_currentBuffer);
+        ADC_currentBuffer = NULL;
     }
 }
 
-void ADC_startAutoSampling(){
+DMA_RINGBUFFERHANDLE_t * ADC_startAutoSampling(uint32_t sampleCount){
     //are we sampling already?
     if(!ADC_isAutoSampling()){
         //no => start asam
+        
+        //first power up the ADC so it has time to get ready
+        ADC_powerUp();
         
         //first make sure that the interrupt sequence is reset and the sample size set appropriately
         //reset sequence (TODO evaluate if this actually does what I expect it to do)
@@ -199,12 +187,19 @@ void ADC_startAutoSampling(){
         }
         AD1CON2bits.SMPI = channelsActive - 1;
         
+        //setup the dma ringbuffer to take data out of the ADC
+        ADC_currentBuffer = DMA_createRingBuffer(sampleCount * sizeof(ADC_ADCBUF_t) * channelsActive, sizeof(ADC_ADCBUF_t) * channelsActive, &ADC1BUF0, _ADC_IRQ, 2, RINGBUFFER_DIRECTION_RX);
+        
+        //enable debug isr
+        IPC5bits.AD1IP = 3;
+        IEC0bits.AD1IE = 0;
+        
         //start the conversion
         AD1CON1bits.ASAM = 1;
     }
+    return ADC_currentBuffer;
 }
 
-typedef enum {ADC_REF_SUPPLY, ADC_REF_EXTREF} ADC_RefSource_t;
 void ADC_setVrefSource(ADC_RefSource_t pRef, ADC_RefSource_t nRef){
     uint32_t reference = ((pRef == ADC_REF_EXTREF) ? 0b1 : 0) | ((nRef == ADC_REF_EXTREF) ? 0b10 : 0);
     AD1CON2bits.VCFG = reference & 0b11;
@@ -241,4 +236,9 @@ static void ADC_powerDown(){
 
 static void ADC_powerUp(){
     AD1CON1bits.ON = 1;
+}
+
+static void __ISR(_ADC_VECTOR) adcISR(){
+    IFS0CLR = _IFS0_AD1IF_MASK;
+    LATBINV = _LATB_LATB6_MASK;
 }
