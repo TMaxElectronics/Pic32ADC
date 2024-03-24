@@ -2,16 +2,29 @@
 #include <stdint.h>
 #include <limits.h>
 #include <sys/attribs.h>
+#include <proc/p32mx170f256b.h>
 
 #include "ADC.h"
 #include "FreeRTOSConfig.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "System.h"
+#include "RingBuffer.h"
 
 static void ADC_powerUp();
 static void ADC_powerDown();
-static DMA_RINGBUFFERHANDLE_t * ADC_currentBuffer = NULL;
+
+static RingBuffer_t * ADC_currentBuffer = NULL;
+static SemaphoreHandle_t ADC_currSampleSemaphore = NULL;
+
+static uint32_t * ADC_averages = NULL;
+static uint32_t ADC_averageCount = 0;
+static uint32_t ADC_targetAverages = 0;
+static uint32_t ADC_averageShifter = 0;
+static uint32_t ADC_activeChannels = 0;
+
+static uint32_t * ADC_bufferPointers[16] = {&ADC1BUF0, &ADC1BUF1, &ADC1BUF2, &ADC1BUF3, &ADC1BUF4, &ADC1BUF5, &ADC1BUF6, &ADC1BUF7, &ADC1BUF8, &ADC1BUF9, &ADC1BUFA, &ADC1BUFB, &ADC1BUFC, &ADC1BUFD, &ADC1BUFE, &ADC1BUFF};
+
 
 static struct ADC_setup{
     uint32_t ASAM;
@@ -30,6 +43,8 @@ void ADC_init(ADC_OUTPUT_FORMAT_t format, uint32_t conversionTime_us){
     if(clockScaler > 0xff) clockScaler = 0xff;
     AD1CON3 = ((autoSampleScaler & 0x1f) << 8) | (clockScaler & 0xff);
     AD1CHS = 0;
+    
+    ADC_currSampleSemaphore = xSemaphoreCreateBinary();
     
     //reduce power consumption as long as no conversion is running
     //perform a read so the done flag is set... TODO implement this properly
@@ -130,6 +145,65 @@ void ADC_setMuxBConfig(uint32_t posInput, uint32_t negInput){
     AD1CHSbits.CH0SB = posInput;
 }
 
+#pragma GCC push_options
+#pragma GCC optimize ("Os")
+
+void __ISR(_ADC_VECTOR) ADC_sampleInterrupt(){
+    IEC0CLR = _IEC0_AD1IE_MASK;
+    
+    //is a buffer available?
+    if(ADC_averages == NULL){
+        BaseType_t val = 0;
+        //no. That means a task is likely waiting for completion of sampling. Return the semaphore
+        xSemaphoreGiveFromISR(ADC_currSampleSemaphore, &val);
+        
+        portEND_SWITCHING_ISR(val);
+        return; //is this actually necessary?
+    }else{
+//TODO reimplement sampling without averaging
+        
+        //write values to ringbuffer
+        uint32_t count = AD1CON2bits.SMPI+1;
+        
+    //get the data out of the buffers and add it to the accumulators
+        
+        ADC_ADCBUF_t * currBuff = &ADC1BUF0;
+        if(!AD1CON2bits.BUFS && AD1CON2bits.BUFM) currBuff = &ADC1BUF8;
+        
+        
+        for(uint32_t i = 0; i < count; i++){
+            //readout the data form the buffer (this must be done even with the buffer full as the AD_IRQ is persistent until all data has been read)
+            ADC_averages[i] += (currBuff++)->sample;
+        }
+        
+    //do we need to add up the samples or did we sample enough to calculate the average
+        if(++ADC_averageCount == ADC_targetAverages){
+            //yes there are. Calculate the average value and write them to the buffer
+            
+            //check if there is even enough space to write a set of samples
+            if(RingBuffer_getSpaceCount(ADC_currentBuffer) > count){
+                //yes there is => write the data
+                
+                uint32_t val = 0;
+                for(uint32_t i = 0; i < count; i++){
+                    //readout the data form the buffer (this must be done even with the buffer full as the AD_IRQ is persistent until all data has been read)
+                    val = ADC_averages[i] >> ADC_averageShifter;
+                    ADC_averages[i] = 0;
+                    RingBuffer_writeSingleWord(ADC_currentBuffer, &val);
+                }
+            }
+        
+            ADC_averageCount = 0;
+        }
+    }
+    
+    //clear flag
+    IFS0CLR = _IFS0_AD1IF_MASK;
+    
+    IEC0SET = _IEC0_AD1IE_MASK;
+}
+#pragma GCC pop_options
+
 void ADC_setInputScan(uint32_t scanningEnabled, uint32_t alternatingEnabled){
     uint32_t resumeSampling = 0;
     
@@ -161,13 +235,19 @@ void ADC_stopAutoSampling(){
 #else
         while(AD1CON1 & _AD1CON1_CLRASAM_MASK);
 #endif
+        //clear interrupt enable
+        IEC0bits.AD1IE = 0;
+        
         //de-initialize the ringbuffer (this will flush all data!)
-        DMA_freeRingBuffer(ADC_currentBuffer);
+        RingBuffer_delete(ADC_currentBuffer);
         ADC_currentBuffer = NULL;
+        
+        vPortFree(ADC_averages);
+        ADC_averages = NULL;
     }
 }
 
-DMA_RINGBUFFERHANDLE_t * ADC_startAutoSampling(uint32_t sampleCount){
+RingBuffer_t * ADC_startAutoSampling(uint32_t sampleCount, uint32_t superSamplingBits){
     //are we sampling already?
     if(!ADC_isAutoSampling()){
         //no => start asam
@@ -187,12 +267,21 @@ DMA_RINGBUFFERHANDLE_t * ADC_startAutoSampling(uint32_t sampleCount){
         }
         AD1CON2bits.SMPI = channelsActive - 1;
         
+        ADC_activeChannels = channelsActive;
+        ADC_targetAverages = 1 << superSamplingBits;
+        ADC_averageShifter = superSamplingBits;
+        ADC_averageCount = 0;
+        ADC_averages = pvPortMalloc(sizeof(uint32_t) * channelsActive);
+        
+        //enable split buffer
+        AD1CON2bits.BUFM = 1;
+        
         //setup the dma ringbuffer to take data out of the ADC
-        ADC_currentBuffer = DMA_createRingBuffer(sampleCount * sizeof(ADC_ADCBUF_t) * channelsActive, sizeof(ADC_ADCBUF_t) * channelsActive, &ADC1BUF0, _ADC_IRQ, 2, RINGBUFFER_DIRECTION_RX);
+        ADC_currentBuffer = RingBuffer_create(sampleCount * channelsActive, sizeof(int16_t));
         
         //enable debug isr
-        IPC5bits.AD1IP = 3;
-        IEC0bits.AD1IE = 0;
+        IPC5bits.AD1IP = 4;
+        IEC0bits.AD1IE = 1;
         
         //start the conversion
         AD1CON1bits.ASAM = 1;
@@ -236,9 +325,4 @@ static void ADC_powerDown(){
 
 static void ADC_powerUp(){
     AD1CON1bits.ON = 1;
-}
-
-static void __ISR(_ADC_VECTOR) adcISR(){
-    IFS0CLR = _IFS0_AD1IF_MASK;
-    LATBINV = _LATB_LATB6_MASK;
 }
