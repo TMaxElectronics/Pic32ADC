@@ -21,6 +21,7 @@ uint32_t ADC_read(uint32_t channel);
 
 uint32_t ADC_getActiveChannelCount();
 uint32_t ADC_setupAutoSampling(uint32_t enabled, uint32_t sampleRate_Hz);
+uint32_t ADC_getAutoSampleRate_Hz();
 void ADC_selectScanChannels(uint32_t channelsSelected);
 void ADC_setMuxAConfig(uint32_t posInput, uint32_t negInput);
 void ADC_setMuxBConfig(uint32_t posInput, uint32_t negInput);

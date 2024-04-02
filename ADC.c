@@ -123,6 +123,11 @@ uint32_t ADC_setupAutoSampling(uint32_t enabled, uint32_t sampleRate_Hz){
     }
 }
 
+uint32_t ADC_getAutoSampleRate_Hz(){
+    uint32_t rate = configPERIPHERAL_CLOCK_HZ / (2 * (AD1CON3bits.ADCS+1) * (12 + AD1CON3bits.SAMC));
+    return rate;
+}
+
 void ADC_selectScanChannels(uint32_t channelsSelected){
     uint32_t resumeSampling = 0;
     
