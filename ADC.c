@@ -196,6 +196,11 @@ void __ISR(_ADC_VECTOR) ADC_sampleInterrupt(){
                     ADC_averages[i] = 0;
                     RingBuffer_writeSingleWord(ADC_currentBuffer, &val);
                 }
+            }else{
+                //no space in the buffer, we have to ignore this set of data :( But zero the accumulators to make sure the next readings are valid
+                for(uint32_t i = 0; i < count; i++){
+                    ADC_averages[i] = 0;
+                }
             }
         
             ADC_averageCount = 0;
