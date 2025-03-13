@@ -172,8 +172,8 @@ void __ISR(_ADC_VECTOR) ADC_sampleInterrupt(){
         
     //get the data out of the buffers and add it to the accumulators
         
-        ADC_ADCBUF_t * currBuff = &ADC1BUF0;
-        if(!AD1CON2bits.BUFS && AD1CON2bits.BUFM) currBuff = &ADC1BUF8;
+        ADC_ADCBUF_t * currBuff = (ADC_ADCBUF_t *) &ADC1BUF0;
+        if(!AD1CON2bits.BUFS && AD1CON2bits.BUFM) currBuff = (ADC_ADCBUF_t *) &ADC1BUF8;
         
         
         for(uint32_t i = 0; i < count; i++){
@@ -240,7 +240,7 @@ void ADC_stopAutoSampling(){
         AD1CON1SET = _AD1CON1_CLRASAM_MASK;
         
         //wait for the conversion to finish. Do it in a non-blocking way if freeRTOS is available
-#if __has_include("FreeRTOS.h")
+#if !__is_compiling || __has_include("FreeRTOS.h")
         while(AD1CON1 & _AD1CON1_CLRASAM_MASK) vTaskDelay(1);
 #else
         while(AD1CON1 & _AD1CON1_CLRASAM_MASK);
