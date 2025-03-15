@@ -211,6 +211,7 @@ void __ISR(_ADC_VECTOR) ADC_sampleInterrupt(){
     IFS0CLR = _IFS0_AD1IF_MASK;
     
     IEC0SET = _IEC0_AD1IE_MASK;
+    portEND_SWITCHING_ISR(0);
 }
 #pragma GCC pop_options
 
