@@ -10,6 +10,7 @@
 #include "task.h"
 #include "System.h"
 #include "RingBuffer.h"
+#include "util.h"
 
 static void ADC_powerUp();
 static void ADC_powerDown();
@@ -38,10 +39,10 @@ void ADC_init(ADC_OUTPUT_FORMAT_t format, uint32_t conversionTime_us){
     AD1CON1 = 0b1000000011100000 | ((format & 0x7) << 8);
     AD1CON2 = 0;
     
-    uint32_t autoSampleScaler = 0;
     uint32_t clockScaler = (((configPERIPHERAL_CLOCK_HZ / 1000) * conversionTime_us) / 24000) - 1;
     if(clockScaler > 0xff) clockScaler = 0xff;
-    AD1CON3 = ((autoSampleScaler & 0x1f) << 8) | (clockScaler & 0xff);
+    
+    AD1CON3 = (clockScaler & 0xff);
     AD1CHS = 0;
     
     ADC_currSampleSemaphore = xSemaphoreCreateBinary();
@@ -62,7 +63,7 @@ uint32_t ADC_getActiveChannelCount(){
         
         //scan through the scan input select register
         for(uint32_t i = 0; i < 16; i++){
-            if(AD1CSSL & SYS_BITMASK[i]) channelsActive ++;
+            if(AD1CSSL & util_bitMasks[i]) channelsActive ++;
         }
     }
     
@@ -314,7 +315,11 @@ uint32_t ADC_read(uint32_t channel){
         //switch channel
         AD1CHSbits.CH0SA = channel;
         //wait one tick after input channel change
-        vTaskDelay(1);
+        if(xTaskGetSchedulerState() != taskSCHEDULER_RUNNING){
+            SYS_waitCP0(10);
+        }else{
+            vTaskDelay(1);
+        }
     }
     
     AD1CON1CLR = _AD1CON1_DONE_MASK;
