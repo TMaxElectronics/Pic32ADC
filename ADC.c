@@ -316,7 +316,7 @@ uint32_t ADC_read(uint32_t channel){
         AD1CHSbits.CH0SA = channel;
         //wait one tick after input channel change
         if(xTaskGetSchedulerState() != taskSCHEDULER_RUNNING){
-            SYS_waitCP0(10);
+            SYS_waitCP0_ms(10);
         }else{
             vTaskDelay(1);
         }
